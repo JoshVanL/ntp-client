@@ -36,11 +36,12 @@ type PacketNTP struct {
 }
 
 type PairPacketNTP struct {
-	queryPacket   *PacketNTP
-	recvPacket    *PacketNTP
-	localAddress  *net.UDPAddr
-	remoteAdderss *net.UDPAddr
-	serverHost    string
+	queryPacket      *PacketNTP
+	recvPacket       *PacketNTP
+	localAddress     *net.UDPAddr
+	remoteAdderss    *net.UDPAddr
+	serverHost       string
+	transmissionTime time.Duration
 }
 
 type QueryOptions struct {
@@ -52,8 +53,8 @@ type QueryOptions struct {
 }
 
 var (
-	host     = "uk.pool.ntp.org"
-	ntpEpoch = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
+	host  = "uk.pool.ntp.org"
+	Epoch = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC) //Epoch of NTP
 )
 
 func NewNTPClient() *NTPClient {
@@ -68,16 +69,22 @@ func NewNTPClient() *NTPClient {
 	return ntpClient
 }
 
-func (n *NTPClient) getTime() error {
+func (n *NTPClient) getTime() (now time.Time, err error) {
 	var result *multierror.Error
+	var offsets []time.Duration
 
 	for _, pair := range n.pairPackets {
-		if err := pair.requestTime(n.QueryOptions); err != nil {
+		off, err := pair.requestTime(n.QueryOptions)
+		if err != nil {
 			result = multierror.Append(result, fmt.Errorf("error getting time from pair: %v", err))
+		} else {
+			offsets = append(offsets, off)
 		}
 	}
 
-	return result.ErrorOrNil()
+	now = time.Now().Add(n.averageOffSet(offsets))
+
+	return now, result.ErrorOrNil()
 }
 
 func NewPairPacket(host string) *PairPacketNTP {
@@ -108,8 +115,7 @@ func (p *PairPacketNTP) NewQueryPacket() *PacketNTP {
 	return packet
 }
 
-func (p *PairPacketNTP) requestTime(options *QueryOptions) error {
-	var err error
+func (p *PairPacketNTP) requestTime(options *QueryOptions) (offset time.Duration, err error) {
 	var result *multierror.Error
 
 	if options.LocalAddress != "" {
@@ -124,19 +130,19 @@ func (p *PairPacketNTP) requestTime(options *QueryOptions) error {
 	}
 
 	if result != nil {
-		return result
+		return 0, result
 	}
 
 	p.setVersionNumber(options.Version)
 
 	p.remoteAdderss, err = net.ResolveUDPAddr("udp", net.JoinHostPort(p.serverHost, strconv.Itoa(options.Port)))
 	if err != nil {
-		return fmt.Errorf("failed to resolve host address: %v", err)
+		return 0, fmt.Errorf("failed to resolve host address: %v", err)
 	}
 
 	con, err := net.DialUDP("udp", p.localAddress, p.remoteAdderss)
 	if err != nil {
-		return fmt.Errorf("failed to connect to remote server: %v", err)
+		return 0, fmt.Errorf("failed to connect to remote server: %v", err)
 	}
 	defer con.Close()
 
@@ -145,7 +151,7 @@ func (p *PairPacketNTP) requestTime(options *QueryOptions) error {
 	// Use a random transmit time in message to increase privacy and prevent spoofing
 	randomBits := make([]byte, 8)
 	if _, err := rand.Read(randomBits); err != nil {
-		return fmt.Errorf("failed to generate random bits for transmit time: %v", err)
+		return 0, fmt.Errorf("failed to generate random bits for transmit time: %v", err)
 	}
 
 	p.queryPacket.TransmitTime = uint64(binary.BigEndian.Uint64(randomBits))
@@ -153,27 +159,49 @@ func (p *PairPacketNTP) requestTime(options *QueryOptions) error {
 
 	// Send query
 	if err := binary.Write(con, binary.BigEndian, p.queryPacket); err != nil {
-		return fmt.Errorf("failed to send ntp query to server: %v", err)
+		return 0, fmt.Errorf("failed to send ntp query to server: %v", err)
 	}
 
 	// Receive response
 	if err := binary.Read(con, binary.BigEndian, p.recvPacket); err != nil {
-		return fmt.Errorf("responding network error: %v", err)
+		return 0, fmt.Errorf("responding network error: %v", err)
 	}
 
-	transmissionTime := time.Since(realTransmitTime)
+	p.transmissionTime = time.Since(realTransmitTime)
+	p.queryPacket.OriginTime = p.ntpTime(realTransmitTime)
 
-	if err := p.verifyResponsePacket(); err != nil {
-		return fmt.Errorf("error verifying response packet: %v", err)
-	}
-
-	fmt.Printf("(%s) transmission time: %v\n", p.serverHost, transmissionTime.String())
-
-	return nil
+	return p.calculateOffset(), nil
 }
 
 func (p *PairPacketNTP) setVersionNumber(version int) {
 	p.queryPacket.LiVnMode = (p.queryPacket.LiVnMode & 0xc7) | (uint8(version) << 3) // ( LiVnMode & 11000111) | 00VER111
+}
+
+func (p *PairPacketNTP) calculateOffset() time.Duration {
+	//t1 = local clock, time request sent by client;
+	//t2 = server clock, time request received by server;
+	//t3 = server clock, time reply sent by server;
+	//t4 = local clock, time reply received by client
+	//o = ((t2 - t1) + (t3 - t4)) / 2
+	t2t1 := p.recvPacket.ReceivedTime - p.queryPacket.OriginTime
+	t3t4 := p.recvPacket.TransmitTime - p.recvPacket.ReceivedTime
+	return p.duration((t2t1 - t3t4) / 2)
+}
+
+//golang time to 64 bit conv
+func (p *PairPacketNTP) ntpTime(goTime time.Time) uint64 {
+	nsec := uint64(goTime.Sub(Epoch))
+	nanoPerSec := uint64(1e9)
+	sec := nsec / nanoPerSec
+	frac := (((nsec - sec*nanoPerSec) << 32) + nanoPerSec - 1) / nanoPerSec
+	return uint64(sec<<32 | frac)
+}
+
+func (p *PairPacketNTP) duration(ntptime uint64) time.Duration {
+	nanoPerSec := uint64(1e9)
+	sec := (ntptime >> 32) * nanoPerSec
+	frac := (ntptime & 0xffffffff) * nanoPerSec >> 32
+	return time.Duration(sec + frac)
 }
 
 func (p *PairPacketNTP) verifyResponsePacket() error {
@@ -195,12 +223,25 @@ func (p *PairPacketNTP) verifyResponsePacket() error {
 	return result.ErrorOrNil()
 }
 
+func (n *NTPClient) averageOffSet(offsets []time.Duration) time.Duration {
+	var avg int64
+
+	for _, offset := range offsets {
+		avg += offset.Nanoseconds()
+	}
+
+	return time.Duration(avg / int64(len(offsets)))
+}
+
 func main() {
 
 	ntp := NewNTPClient()
-	if err := ntp.getTime(); err != nil {
+	now, err := ntp.getTime()
+	if err != nil {
 		fmt.Printf("%v", err)
 	}
+
+	fmt.Printf("The time now :%v\n", now)
 
 	return
 }
