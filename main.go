@@ -13,8 +13,6 @@ import (
 )
 
 type NTPClient struct {
-	//log *logrus.Entry
-
 	pairPackets  [4]*PairPacketNTP
 	QueryOptions *QueryOptions
 }
@@ -79,6 +77,7 @@ func (n *NTPClient) getTime() (now time.Time, err error) {
 			result = multierror.Append(result, fmt.Errorf("error getting time from pair: %v", err))
 		} else {
 			offsets = append(offsets, off)
+			fmt.Printf("> %v\n", off)
 		}
 	}
 
@@ -183,9 +182,9 @@ func (p *PairPacketNTP) calculateOffset() time.Duration {
 	//t3 = server clock, time reply sent by server;
 	//t4 = local clock, time reply received by client
 	//o = ((t2 - t1) + (t3 - t4)) / 2
-	t2t1 := p.recvPacket.ReceivedTime - p.queryPacket.OriginTime
-	t3t4 := p.recvPacket.TransmitTime - p.recvPacket.ReceivedTime
-	return p.duration((t2t1 - t3t4) / 2)
+	t2t1 := p.epochTime(p.recvPacket.ReceivedTime).Sub(p.epochTime(p.queryPacket.OriginTime))
+	t3t4 := p.epochTime(p.recvPacket.TransmitTime).Sub(p.epochTime(p.recvPacket.ReceivedTime))
+	return (t2t1 + t3t4) // / time.Duration(2)
 }
 
 //golang time to 64 bit conv
@@ -202,6 +201,10 @@ func (p *PairPacketNTP) duration(ntptime uint64) time.Duration {
 	sec := (ntptime >> 32) * nanoPerSec
 	frac := (ntptime & 0xffffffff) * nanoPerSec >> 32
 	return time.Duration(sec + frac)
+}
+
+func (p *PairPacketNTP) epochTime(atime uint64) time.Time {
+	return Epoch.Add(p.duration(atime))
 }
 
 func (p *PairPacketNTP) verifyResponsePacket() error {
@@ -228,6 +231,7 @@ func (n *NTPClient) averageOffSet(offsets []time.Duration) time.Duration {
 
 	for _, offset := range offsets {
 		avg += offset.Nanoseconds()
+		fmt.Printf("%v\n", offset.Seconds())
 	}
 
 	return time.Duration(avg / int64(len(offsets)))
@@ -241,7 +245,8 @@ func main() {
 		fmt.Printf("%v", err)
 	}
 
-	fmt.Printf("The time now :%v\n", now)
+	fmt.Printf("\nThe time now :%v\n", time.Now())
+	fmt.Printf("\nThe time now :%v\n", now)
 
 	return
 }
